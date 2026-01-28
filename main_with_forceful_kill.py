@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Minimal Learnable Texture Python TUI Demo
+Enhanced Learnable Texture Python TUI Demo with Forceful Thread Termination
+
+This version demonstrates handling truly stuck/unresponsive threads using:
+1. Cooperative cancellation (threading.Event) - for well-behaved threads
+2. Forceful termination using multiprocessing - for stuck/deadlocked threads
+3. Watchdog pattern - to detect and handle unresponsive tasks
 
 Architecture:
-- Process 1: UI Builder (Frontend) - Uses curses for TUI
-- Process 2: Backend Worker - Accepts messages, spawns threads, sends status back
-- Communication: multiprocessing.Queue for IPC
+- Uses multiprocessing.Process instead of threading.Thread for tasks
+- Each task runs in its own process (can be terminated forcefully)
+- Watchdog monitors task health and can trigger termination
+- UI can send KILL signal for truly stuck processes
 """
 
 import curses
@@ -14,9 +20,11 @@ import queue
 import random
 import threading
 import time
+import signal
+import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict
 
 
 class MessageType(Enum):
@@ -24,7 +32,8 @@ class MessageType(Enum):
     TASK_REQUEST = "task_request"
     TASK_STATUS = "task_status"
     TASK_COMPLETE = "task_complete"
-    TASK_CANCEL = "task_cancel"
+    TASK_CANCEL = "task_cancel"      # Cooperative cancellation
+    TASK_KILL = "task_kill"          # Forceful termination
     TASK_RESTART = "task_restart"
     SHUTDOWN = "shutdown"
 
@@ -39,41 +48,35 @@ class IPCMessage:
     progress: Optional[int] = None
 
 
-class BackendWorker:
-    """Backend worker process that handles tasks and spawns threads"""
+def task_worker_process(task_id: int, content: str, output_queue: mp.Queue):
+    """
+    Worker function that runs in a separate process.
+    This can be forcefully terminated if it gets stuck.
+    """
+    # Set up signal handler for graceful termination
+    def signal_handler(signum, frame):
+        output_queue.put(IPCMessage(
+            msg_type=MessageType.TASK_STATUS,
+            task_id=task_id,
+            status="Process terminated by signal",
+            progress=0
+        ))
+        exit(0)
 
-    def __init__(self, input_queue: mp.Queue, output_queue: mp.Queue):
-        self.input_queue = input_queue
-        self.output_queue = output_queue
-        self.active_tasks = {}
-        self.task_counter = 0
-        self.running = True
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
-    def process_task(self, task_id: int, content: str, cancel_event: threading.Event):
-        """Simulate a learnable texture processing task with cancellation support"""
+    try:
         # Simulate work with random delays
         steps = random.randint(3, 8)
 
         for i in range(steps):
-            # Check for cancellation
-            if cancel_event.is_set():
-                self.output_queue.put(IPCMessage(
-                    msg_type=MessageType.TASK_STATUS,
-                    task_id=task_id,
-                    status="Task cancelled",
-                    progress=0
-                ))
-                return
-
-            if not self.running:
-                break
-
             # Update progress
             progress = int((i + 1) / steps * 100)
             status = f"Processing step {i + 1}/{steps}"
 
             # Send status update
-            self.output_queue.put(IPCMessage(
+            output_queue.put(IPCMessage(
                 msg_type=MessageType.TASK_STATUS,
                 task_id=task_id,
                 status=status,
@@ -83,27 +86,62 @@ class BackendWorker:
             # Simulate work
             time.sleep(random.uniform(0.3, 0.8))
 
-        # Check if cancelled before completing
-        if cancel_event.is_set():
-            self.output_queue.put(IPCMessage(
-                msg_type=MessageType.TASK_STATUS,
-                task_id=task_id,
-                status="Task cancelled",
-                progress=0
-            ))
-            return
-
         # Mark as complete
-        self.output_queue.put(IPCMessage(
+        output_queue.put(IPCMessage(
             msg_type=MessageType.TASK_COMPLETE,
             task_id=task_id,
             status="Completed successfully",
             progress=100
         ))
 
-        # Clean up
-        if task_id in self.active_tasks:
-            del self.active_tasks[task_id]
+    except Exception as e:
+        output_queue.put(IPCMessage(
+            msg_type=MessageType.TASK_STATUS,
+            task_id=task_id,
+            status=f"Error: {str(e)}",
+            progress=0
+        ))
+
+
+class BackendWorker:
+    """Backend worker process that handles tasks using multiprocessing"""
+
+    def __init__(self, input_queue: mp.Queue, output_queue: mp.Queue):
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.active_tasks: Dict[int, Dict] = {}
+        self.task_counter = 0
+        self.running = True
+        self.watchdog_thread = None
+        self.watchdog_stop_event = threading.Event()
+
+    def start_watchdog(self):
+        """Start watchdog thread to monitor task health"""
+        def watchdog():
+            while not self.watchdog_stop_event.is_set():
+                time.sleep(1.0)  # Check every second
+                for task_id, task_info in list(self.active_tasks.items()):
+                    process = task_info.get("process")
+                    if process and process.is_alive():
+                        # Check if task is stuck (no progress for too long)
+                        last_update = task_info.get("last_update", 0)
+                        if time.time() - last_update > 10:  # 10 second timeout
+                            # Task appears stuck, send warning
+                            self.output_queue.put(IPCMessage(
+                                msg_type=MessageType.TASK_STATUS,
+                                task_id=task_id,
+                                status="⚠️  Task appears stuck (no progress)",
+                                progress=task_info.get("progress", 0)
+                            ))
+
+        self.watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        self.watchdog_thread.start()
+
+    def stop_watchdog(self):
+        """Stop the watchdog thread"""
+        self.watchdog_stop_event.set()
+        if self.watchdog_thread:
+            self.watchdog_thread.join(timeout=1)
 
     def handle_message(self, msg: IPCMessage):
         """Handle incoming messages from UI process"""
@@ -111,24 +149,26 @@ class BackendWorker:
             self.task_counter += 1
             task_id = self.task_counter
 
-            # Create cancellation event for this task
-            cancel_event = threading.Event()
+            # Create output queue for this task
+            task_output_queue = mp.Queue()
 
             # Store task info
             self.active_tasks[task_id] = {
                 "content": msg.content,
-                "thread": None,
-                "cancel_event": cancel_event
+                "process": None,
+                "output_queue": task_output_queue,
+                "last_update": time.time(),
+                "progress": 0
             }
 
-            # Spawn a thread to process the task
-            thread = threading.Thread(
-                target=self.process_task,
-                args=(task_id, msg.content, cancel_event),
-                daemon=True
+            # Spawn a process to process the task
+            # Note: Not daemon to allow child processes
+            process = mp.Process(
+                target=task_worker_process,
+                args=(task_id, msg.content, task_output_queue)
             )
-            thread.start()
-            self.active_tasks[task_id]["thread"] = thread
+            process.start()
+            self.active_tasks[task_id]["process"] = process
 
             # Send immediate acknowledgment
             self.output_queue.put(IPCMessage(
@@ -139,51 +179,73 @@ class BackendWorker:
             ))
 
         elif msg.msg_type == MessageType.TASK_CANCEL:
-            # Cancel a running task
+            # Cooperative cancellation - ask process to stop gracefully
             task_id = msg.task_id
             if task_id in self.active_tasks:
                 task_info = self.active_tasks[task_id]
-                cancel_event = task_info.get("cancel_event")
-                if cancel_event:
-                    cancel_event.set()
+                process = task_info.get("process")
+                if process and process.is_alive():
+                    # Send SIGTERM for graceful termination
+                    process.terminate()
                     self.output_queue.put(IPCMessage(
                         msg_type=MessageType.TASK_STATUS,
                         task_id=task_id,
-                        status="Cancelling task...",
+                        status="Cancelling task (graceful)...",
                         progress=0
                     ))
 
-        elif msg.msg_type == MessageType.TASK_RESTART:
-            # Restart a task (cancel if running, then start new)
+        elif msg.msg_type == MessageType.TASK_KILL:
+            # Forceful termination - kill the process immediately
             task_id = msg.task_id
             if task_id in self.active_tasks:
                 task_info = self.active_tasks[task_id]
-                cancel_event = task_info.get("cancel_event")
-                if cancel_event:
-                    cancel_event.set()
+                process = task_info.get("process")
+                if process and process.is_alive():
+                    # Force kill with SIGKILL
+                    try:
+                        os.kill(process.pid, signal.SIGKILL)
+                        self.output_queue.put(IPCMessage(
+                            msg_type=MessageType.TASK_STATUS,
+                            task_id=task_id,
+                            status="Task forcefully killed",
+                            progress=0
+                        ))
+                    except ProcessLookupError:
+                        # Process already dead
+                        pass
 
-            # Start a new task with the same content
+        elif msg.msg_type == MessageType.TASK_RESTART:
+            # Restart a task (kill if running, then start new)
+            task_id = msg.task_id
             if task_id in self.active_tasks:
-                content = self.active_tasks[task_id]["content"]
+                task_info = self.active_tasks[task_id]
+                process = task_info.get("process")
+                if process and process.is_alive():
+                    # Kill existing process
+                    try:
+                        os.kill(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
-                # Create new cancellation event
-                cancel_event = threading.Event()
+                # Start a new process with the same content
+                content = task_info["content"]
+                task_output_queue = mp.Queue()
 
-                # Update task info
                 self.active_tasks[task_id] = {
                     "content": content,
-                    "thread": None,
-                    "cancel_event": cancel_event
+                    "process": None,
+                    "output_queue": task_output_queue,
+                    "last_update": time.time(),
+                    "progress": 0
                 }
 
-                # Spawn a new thread
-                thread = threading.Thread(
-                    target=self.process_task,
-                    args=(task_id, content, cancel_event),
+                process = mp.Process(
+                    target=task_worker_process,
+                    args=(task_id, content, task_output_queue),
                     daemon=True
                 )
-                thread.start()
-                self.active_tasks[task_id]["thread"] = thread
+                process.start()
+                self.active_tasks[task_id]["process"] = process
 
                 # Send status update
                 self.output_queue.put(IPCMessage(
@@ -198,13 +260,33 @@ class BackendWorker:
 
     def run(self):
         """Main worker loop"""
+        self.start_watchdog()
+
         while self.running:
             try:
-                # Non-blocking queue check with timeout
-                msg = self.input_queue.get(timeout=0.1)
-                self.handle_message(msg)
-            except queue.Empty:
-                continue
+                # Check for task output
+                for task_id, task_info in list(self.active_tasks.items()):
+                    try:
+                        msg = task_info["output_queue"].get_nowait()
+                        self.output_queue.put(msg)
+                        task_info["last_update"] = time.time()
+                        if msg.progress:
+                            task_info["progress"] = msg.progress
+
+                        # Clean up completed tasks
+                        if msg.msg_type == MessageType.TASK_COMPLETE:
+                            if task_id in self.active_tasks:
+                                del self.active_tasks[task_id]
+                    except queue.Empty:
+                        pass
+
+                # Check for UI messages
+                try:
+                    msg = self.input_queue.get(timeout=0.1)
+                    self.handle_message(msg)
+                except queue.Empty:
+                    continue
+
             except Exception as e:
                 # Log error but keep running
                 self.output_queue.put(IPCMessage(
@@ -213,6 +295,16 @@ class BackendWorker:
                     status=f"Error: {str(e)}",
                     progress=0
                 ))
+
+        # Cleanup
+        self.stop_watchdog()
+        for task_id, task_info in self.active_tasks.items():
+            process = task_info.get("process")
+            if process and process.is_alive():
+                try:
+                    os.kill(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class UIFrontend:
@@ -226,7 +318,7 @@ class UIFrontend:
         self.running = True
         self.status_messages = []
         self.selected_task = 0
-        self.needs_redraw = True  # Track if screen needs to be redrawn
+        self.needs_redraw = True
 
     def add_status_message(self, msg: str):
         """Add a status message to display"""
@@ -279,17 +371,27 @@ class UIFrontend:
         self.output_queue.put(IPCMessage(msg_type=MessageType.SHUTDOWN))
 
     def send_cancel(self, task_id: int):
-        """Send cancel request for a task to backend"""
+        """Send cancel request (graceful termination)"""
         if task_id in self.tasks:
             self.output_queue.put(IPCMessage(
                 msg_type=MessageType.TASK_CANCEL,
                 task_id=task_id
             ))
-            self.add_status_message(f"Cancelling task {task_id}...")
+            self.add_status_message(f"Cancelling task {task_id} (graceful)...")
+            self.needs_redraw = True
+
+    def send_kill(self, task_id: int):
+        """Send kill request (forceful termination)"""
+        if task_id in self.tasks:
+            self.output_queue.put(IPCMessage(
+                msg_type=MessageType.TASK_KILL,
+                task_id=task_id
+            ))
+            self.add_status_message(f"Killing task {task_id} (forceful)...")
             self.needs_redraw = True
 
     def send_restart(self, task_id: int):
-        """Send restart request for a task to backend"""
+        """Send restart request"""
         if task_id in self.tasks:
             self.output_queue.put(IPCMessage(
                 msg_type=MessageType.TASK_RESTART,
@@ -304,34 +406,35 @@ class UIFrontend:
         height, width = stdscr.getmaxyx()
 
         # Title
-        title = "=== Learnable Texture Demo ==="
+        title = "=== Learnable Texture Demo (Forceful Kill Support) ==="
         stdscr.addstr(0, (width - len(title)) // 2, title, curses.A_BOLD)
 
         # Instructions
         instructions = [
             "1-9: Create new task",
             "Arrow keys: Navigate tasks",
-            "k: Kill selected task",
-            "r: Restart selected task",
+            "k: Graceful cancel (SIGTERM)",
+            "K: Forceful kill (SIGKILL)",
+            "r: Restart task",
             "q: Quit"
         ]
         for i, line in enumerate(instructions):
             stdscr.addstr(2 + i, 2, line)
 
         # Active Tasks Section
-        stdscr.addstr(6, 2, "Active Tasks:", curses.A_BOLD)
+        stdscr.addstr(9, 2, "Active Tasks:", curses.A_BOLD)
 
         if not self.tasks:
-            stdscr.addstr(7, 4, "No active tasks. Press 1-9 to create one.")
+            stdscr.addstr(10, 4, "No active tasks. Press 1-9 to create one.")
         else:
             # Sort tasks by ID
             sorted_tasks = sorted(self.tasks.items())
 
             for idx, (task_id, info) in enumerate(sorted_tasks):
-                if idx >= height - 15:  # Don't overflow screen
+                if idx >= height - 18:  # Don't overflow screen
                     break
 
-                y = 8 + idx
+                y = 11 + idx
 
                 # Selection indicator
                 prefix = "> " if idx == self.selected_task else "  "
@@ -360,20 +463,20 @@ class UIFrontend:
         footer = "Press 'q' to quit"
         stdscr.addstr(height - 1, (width - len(footer)) // 2, footer)
 
-        # Use doupdate() for smoother updates instead of refresh()
+        # Use doupdate() for smoother updates
         curses.doupdate()
 
     def run(self, stdscr):
         """Main UI loop"""
         curses.curs_set(0)  # Hide cursor
         stdscr.nodelay(True)  # Non-blocking input
-        stdscr.timeout(50)  # 50ms timeout for input (reduced from 100ms)
+        stdscr.timeout(50)  # 50ms timeout for input
 
         while self.running:
             # Process incoming messages
             self.process_incoming_messages()
 
-            # Only redraw if something changed or if it's the first draw
+            # Only redraw if something changed
             if self.needs_redraw:
                 self.draw_ui(stdscr)
                 self.needs_redraw = False
@@ -403,13 +506,21 @@ class UIFrontend:
                         self.selected_task = min(len(self.tasks) - 1, self.selected_task + 1)
                         self.needs_redraw = True
 
-                # Kill selected task
+                # Graceful cancel (SIGTERM)
                 elif key == ord('k'):
                     if self.tasks:
                         sorted_tasks = sorted(self.tasks.items())
                         if 0 <= self.selected_task < len(sorted_tasks):
                             task_id = sorted_tasks[self.selected_task][0]
                             self.send_cancel(task_id)
+
+                # Forceful kill (SIGKILL)
+                elif key == ord('K'):
+                    if self.tasks:
+                        sorted_tasks = sorted(self.tasks.items())
+                        if 0 <= self.selected_task < len(sorted_tasks):
+                            task_id = sorted_tasks[self.selected_task][0]
+                            self.send_kill(task_id)
 
                 # Restart selected task
                 elif key == ord('r'):
@@ -429,11 +540,9 @@ def ui_process(input_queue: mp.Queue, output_queue: mp.Queue):
     try:
         curses.wrapper(ui.run)
     except Exception as e:
-        # Handle curses initialization errors gracefully
         print(f"UI process error: {e}")
         print("Note: The TUI requires an interactive terminal.")
         print("Try running in a proper terminal or with: python main.py")
-        # Send shutdown to worker
         ui.send_shutdown()
 
 
@@ -445,7 +554,7 @@ def worker_process(input_queue: mp.Queue, output_queue: mp.Queue):
 
 def main():
     """Main entry point - spawns both processes"""
-    print("Starting Learnable Texture Demo...")
+    print("Starting Learnable Texture Demo (with Forceful Kill Support)...")
     print("Setting up IPC queues...")
 
     # Check if we're in an interactive terminal
@@ -458,16 +567,13 @@ def main():
         print("You can test the IPC communication by running in a proper terminal.\n")
 
     # Create queues for bidirectional communication
-    # UI -> Worker: task requests
-    # Worker -> UI: status updates
     ui_to_worker = mp.Queue()
     worker_to_ui = mp.Queue()
 
     print("Starting worker process...")
     worker = mp.Process(
         target=worker_process,
-        args=(ui_to_worker, worker_to_ui),
-        daemon=True
+        args=(ui_to_worker, worker_to_ui)
     )
     worker.start()
 
@@ -481,6 +587,7 @@ def main():
 
     print("\nDemo is running!")
     print("Use the TUI to create tasks (press 1-9)")
+    print("Press 'k' for graceful cancel, 'K' for forceful kill")
     print("Press Ctrl+C to exit\n")
 
     try:
